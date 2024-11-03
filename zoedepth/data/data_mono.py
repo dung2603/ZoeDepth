@@ -27,6 +27,7 @@
 import itertools
 import os
 import random
+from ultralytics import YOLO
 
 import numpy as np
 import cv2
@@ -338,6 +339,7 @@ class DataLoadPreprocess(Dataset):
                 depth_gt = np.array(depth_gt)
                 depth_gt = np.pad(depth_gt, ((crop_params.top, h - crop_params.bottom), (crop_params.left, w - crop_params.right)), 'constant', constant_values=0)
                 depth_gt = Image.fromarray(depth_gt)
+                
 
 
             if self.config.do_random_rotate and (self.config.aug):
@@ -362,11 +364,31 @@ class DataLoadPreprocess(Dataset):
             if self.config.aug and self.config.random_translate:
                 # print("Random Translation!")
                 image, depth_gt = self.random_translate(image, depth_gt, self.config.max_translation)
-
+             
             image, depth_gt = self.train_preprocess(image, depth_gt)
+
+            segmentation_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+            yolo_model = YOLO("yolov10x.pt")
+            results = yolo_model(image_path)
+            if isinstance(results, list) and len(results) > 0:
+                result = results[0]
+                boxes = result.boxes.xyxy.cpu().numpy() if result.boxes is not None else None
+                cls = result.boxes.cls.cpu().numpy() if result.boxes and result.boxes.cls is not None else None
+
+                if boxes is not None:
+                    for i in range(len(boxes)):
+                        if len(boxes[i]) >= 4:
+                            x_min, y_min, x_max, y_max = map(int, boxes[i][:4])
+                            class_id = int(cls[i]) if cls is not None else 0
+                            segmentation_mask[y_min:y_max, x_min:x_max] = class_id + 1
+
+            segmentation_mask = np.expand_dims(segmentation_mask, axis=2)
+
+            
             mask = np.logical_and(depth_gt > self.config.min_depth,
                                   depth_gt < self.config.max_depth).squeeze()[None, ...]
-            sample = {'image': image, 'depth': depth_gt, 'focal': focal,
+            
+            sample = {'image': image, 'depth': depth_gt, 'focal': focal, 'segmentation': segmentation_mask,
                       'mask': mask, **sample}
 
         else:
@@ -379,6 +401,26 @@ class DataLoadPreprocess(Dataset):
                 data_path, remove_leading_slash(sample_path.split()[0]))
             image = np.asarray(self.reader.open(image_path),
                                dtype=np.float32) / 255.0
+            segmentation_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
+            results = yolo_model(image_path)  # Dự đoán YOLO model
+
+               # Kiểm tra nếu có kết quả dự đoán từ YOLO
+            if isinstance(results, list) and len(results) > 0:
+              result = results[0]
+              boxes = result.boxes.xyxy.cpu().numpy() if result.boxes is not None else None
+              cls = result.boxes.cls.cpu().numpy() if result.boxes and result.boxes.cls is not None else None
+
+                  # Tạo mask từ bounding boxes
+              if boxes is not None:
+                  for i in range(len(boxes)):
+                      if len(boxes[i]) >= 4:
+                        x_min, y_min, x_max, y_max = map(int, boxes[i][:4])
+                        class_id = int(cls[i]) if cls is not None else 0
+                        segmentation_mask[y_min:y_max, x_min:x_max] = class_id + 1
+
+               # Thêm trục chiều cho segmentation_mask
+            segmentation_mask = np.expand_dims(segmentation_mask, axis=2)
+            
 
             if self.mode == 'online_eval':
                 gt_path = self.config.gt_path_eval
@@ -417,7 +459,7 @@ class DataLoadPreprocess(Dataset):
                                         352, left_margin:left_margin + 1216, :]
 
             if self.mode == 'online_eval':
-                sample = {'image': image, 'depth': depth_gt, 'focal': focal, 'has_valid_depth': has_valid_depth,
+                sample = {'image': image, 'depth': depth_gt, 'focal': focal, 'has_valid_depth': has_valid_depth,'segmentation': segmentation_mask,
                           'image_path': sample_path.split()[0], 'depth_path': sample_path.split()[1],
                           'mask': mask}
             else:
@@ -428,8 +470,9 @@ class DataLoadPreprocess(Dataset):
                                   depth_gt < self.config.max_depth).squeeze()[None, ...]
             sample['mask'] = mask
 
+        
         if self.transform:
-            sample = self.transform(sample)
+          sample = self.transform(sample)
 
         sample = self.postprocess(sample)
         sample['dataset'] = self.config.dataset
